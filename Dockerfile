@@ -13,7 +13,7 @@ RUN groupadd -r keeper && useradd -r -g keeper -d /app keeper
 COPY package.json package-lock.json* ./
 
 # Install dependencies (includes tsx runtime)
-RUN npm ci
+RUN npm install --omit=dev
 
 # Copy source
 COPY src/ src/
