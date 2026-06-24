@@ -352,6 +352,12 @@ interface MarketStats {
 
 // ── Price Sources ───────────────────────────────────────────
 
+type PriceResult = {
+  price: number;
+  source: string;
+  freshAt: number;
+};
+
 // Pyth Network feed IDs (hex, without 0x prefix) — universal across all chains
 const PYTH_FEED_IDS: Record<string, string> = {
   SOL: "ef0d8b6fda2ceba41da15d4095d1da392a0d2f8ed0c6c7bc0f4cfac8c280b56d",
@@ -438,12 +444,12 @@ async function fetchPythPrices(symbols: string[]): Promise<void> {
   }
 }
 
-function getPythPrice(symbol: string): number | null {
+function getPythPrice(symbol: string): { price: number; freshAt: number } | null {
   const cached = pythCache.get(symbol);
   if (!cached) return null;
   // Reject if older than 30s
   if (Date.now() - cached.ts > 30_000) return null;
-  return cached.price;
+  return { price: cached.price, freshAt: cached.ts };
 }
 
 /** Jupiter price fallback (uses mint addresses) */
@@ -481,18 +487,18 @@ async function fetchDexScreenerPrice(symbol: string): Promise<number | null> {
 }
 
 /** Fetch price with multi-source failover: Pyth → Jupiter → DexScreener → CA lookup */
-async function getPrice(symbol: string, slab?: string): Promise<{ price: number; source: string } | null> {
+async function getPrice(symbol: string, slab?: string): Promise<PriceResult | null> {
   // Primary: Pyth (decentralized oracle, fastest for supported tokens)
   const pyth = getPythPrice(symbol);
-  if (pyth) return { price: pyth, source: "pyth" };
+  if (pyth) return { price: pyth.price, source: "pyth", freshAt: pyth.freshAt };
 
   // Secondary: Jupiter (Solana DEX aggregator, uses mint addresses)
   const jup = await fetchJupiterPrice(symbol);
-  if (jup) return { price: jup, source: "jupiter" };
+  if (jup) return { price: jup, source: "jupiter", freshAt: Date.now() };
 
   // Tertiary: DexScreener (broad coverage for exotic tokens)
   const dex = await fetchDexScreenerPrice(symbol);
-  if (dex) return { price: dex, source: "dexscreener" };
+  if (dex) return { price: dex, source: "dexscreener", freshAt: Date.now() };
 
   // Quaternary: Direct CA lookup for dynamic markets (PERC-465)
   if (slab) {
@@ -708,10 +714,12 @@ async function pushAndCrank(market: MarketInfo, programId: PublicKey): Promise<v
   // all live price sources fail.
   let price: number;
   let source: string;
+  let freshPriceAt: number | null = null;
 
   if (result && isPriceValid(result.price)) {
     price = result.price;
     source = result.source;
+    freshPriceAt = result.freshAt;
   } else if (s.lastPrice > 0) {
     // Devnet / transient no-pool fallback: reuse the last successfully pushed
     // live-source price only while it remains within the freshness threshold.
@@ -791,8 +799,8 @@ async function pushAndCrank(market: MarketInfo, programId: PublicKey): Promise<v
 
   s.lastPrice = price;
   s.lastPushAt = Date.now();
-  if (source !== "last-known") {
-    s.lastFreshPriceAt = s.lastPushAt;
+  if (freshPriceAt !== null) {
+    s.lastFreshPriceAt = freshPriceAt;
   }
   s.lastPushSig = sig;
   s.totalPushes++;
@@ -1111,7 +1119,7 @@ async function discoverNewMarkets(): Promise<MarketInfo[]> {
  * since they may not be in PYTH_FEED_IDS or JUPITER_MINTS.
  * This fetches price directly using the mainnet CA via Jupiter Lite API.
  */
-async function fetchPriceByCA(mainnetCA: string): Promise<{ price: number; source: string } | null> {
+async function fetchPriceByCA(mainnetCA: string): Promise<PriceResult | null> {
   // Validate as base58 Solana address before using in external URLs (#783, #784)
   if (!/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(mainnetCA)) return null;
   const encoded = encodeURIComponent(mainnetCA);
@@ -1125,7 +1133,7 @@ async function fetchPriceByCA(mainnetCA: string): Promise<{ price: number; sourc
     const data = json.data?.[mainnetCA];
     if (data?.price) {
       const p = parseFloat(data.price);
-      if (isFinite(p) && p > 0) return { price: p, source: "jupiter-ca" };
+      if (isFinite(p) && p > 0) return { price: p, source: "jupiter-ca", freshAt: Date.now() };
     }
   } catch {}
 
@@ -1139,7 +1147,7 @@ async function fetchPriceByCA(mainnetCA: string): Promise<{ price: number; sourc
     const pair = json.pairs?.[0];
     if (pair?.priceUsd) {
       const p = parseFloat(pair.priceUsd);
-      if (isFinite(p) && p > 0) return { price: p, source: "dexscreener-ca" };
+      if (isFinite(p) && p > 0) return { price: p, source: "dexscreener-ca", freshAt: Date.now() };
     }
   } catch {}
 
