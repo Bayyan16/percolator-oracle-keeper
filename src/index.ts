@@ -32,6 +32,7 @@
 import {
   Connection, Keypair, PublicKey, Transaction,
   ComputeBudgetProgram, sendAndConfirmTransaction,
+  AccountInfo,
 } from "@solana/web3.js";
 import {
   encodePushOraclePrice, encodeKeeperCrank, encodeUpdateHyperpMark,
@@ -89,12 +90,23 @@ const HARDCODED_BLOCKED_MARKETS = new Set<string>([
  * Both are merged at startup. Use environment variable for emergency blocks
  * without redeploying. Use hardcoded for permanent blocks.
  */
+const envBlockedRaw = (process.env.ORACLE_KEEPER_BLOCKED_MARKETS ?? "").split(",").map(s => s.trim()).filter(Boolean);
+const validatedBlockedMarkets: string[] = [];
+for (const entry of envBlockedRaw) {
+  try {
+    new PublicKey(entry);
+    validatedBlockedMarkets.push(entry);
+  } catch (e) {
+    console.error(`[ERROR] Invalid blocked market address in ORACLE_KEEPER_BLOCKED_MARKETS: "${entry}" — ignoring`);
+  }
+}
+
 const ORACLE_KEEPER_BLOCKED_MARKETS = new Set<string>([
   ...HARDCODED_BLOCKED_MARKETS,
-  ...(process.env.ORACLE_KEEPER_BLOCKED_MARKETS ?? "").split(",").map(s => s.trim()).filter(Boolean),
+  ...validatedBlockedMarkets,
 ]);
 const ADMIN_KP_PATH = process.env.ADMIN_KEYPAIR_PATH ??
-  `${process.env.HOME}/.config/solana/percolator-upgrade-authority.json`;
+  "/app/.config/solana/percolator-upgrade-authority.json";
 // RPC_URL is required and validated at startup by validateEnvironmentConfig()
 // Removed silent fallback to prevent misconfigured production deployments from
 // accidentally connecting to public devnet (HIGH-002 security hardening)
@@ -221,6 +233,47 @@ const slabProgramId = new Map<string, PublicKey>();
  *
  * @throws Exits process with code 1 if validation fails
  */
+/**
+ * Fetch account info with a strict timeout (e.g. 5 seconds) to prevent RPC hangs. (LOW-003)
+ */
+async function getAccountInfoWithTimeout(
+  connection: Connection,
+  publicKey: PublicKey,
+  timeoutMs = 5000,
+): Promise<AccountInfo<Buffer> | null> {
+  let timer: NodeJS.Timeout | undefined;
+  const timeoutPromise = new Promise<null>((_, reject) => {
+    timer = setTimeout(() => {
+      reject(new Error(`RPC timeout: getAccountInfo took longer than ${timeoutMs}ms`));
+    }, timeoutMs);
+  });
+
+  try {
+    return await Promise.race([
+      connection.getAccountInfo(publicKey),
+      timeoutPromise,
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+/**
+ * Validate critical environment variables at startup (HIGH-001 security fix)
+ *
+ * Performs structured validation of config to catch misconfigurations
+ * before they cause runtime failures or silent degradation.
+ *
+ * Validates:
+ * - RPC_URL: Must be a valid URL (not empty)
+ * - SUPABASE_URL: If set, must be valid URL
+ * - SUPABASE_SERVICE_ROLE_KEY: If SUPABASE_URL set, key must be non-empty (100+ chars)
+ * - API_AUTH_TOKEN: If set, must be non-empty
+ * - HEALTH_AUTH_TOKEN: Must be non-empty and set (MED-001)
+ * - HERMES_URL: If set, must use HTTPS (HIGH-002)
+ *
+ * @throws Exits process with code 1 if validation fails
+ */
 function validateEnvironmentConfig(): void {
   const errors: string[] = [];
 
@@ -236,6 +289,19 @@ function validateEnvironmentConfig(): void {
       }
     } catch (e) {
       errors.push(`RPC_URL is not a valid URL: ${rpcUrl}`);
+    }
+  }
+
+  // Validate HERMES_URL (must be HTTPS to prevent SSRF and price injection)
+  const hermesUrl = (process.env.HERMES_URL ?? "").trim();
+  if (hermesUrl) {
+    try {
+      const url = new URL(hermesUrl);
+      if (url.protocol !== "https:") {
+        errors.push(`HERMES_URL must use secure https protocol, got: ${url.protocol}`);
+      }
+    } catch (e) {
+      errors.push(`HERMES_URL is not a valid URL: ${hermesUrl}`);
     }
   }
 
@@ -276,10 +342,12 @@ function validateEnvironmentConfig(): void {
     );
   }
 
-  const healthAuthToken = process.env.HEALTH_AUTH_TOKEN?.trim() ?? "";
-  if (process.env.HEALTH_AUTH_TOKEN && !healthAuthToken) {
+  // Validate health auth token (mandatory check to prevent wallet leak - MED-001)
+  const healthAuthToken = (process.env.HEALTH_AUTH_TOKEN ?? "").trim();
+  if (!healthAuthToken) {
     errors.push(
-      "HEALTH_AUTH_TOKEN is set but empty. Either remove it or provide a token.",
+      "HEALTH_AUTH_TOKEN is required but not set or empty. " +
+      "Please set a secure bearer token for the health check endpoint.",
     );
   }
 
@@ -318,9 +386,13 @@ async function supabaseQuery(table: string, params: string): Promise<any[] | nul
         signal: AbortSignal.timeout(5000),
       },
     );
-    if (!resp.ok) return null;
+    if (!resp.ok) {
+      log(`⚠️ Supabase query to ${table} failed with HTTP status ${resp.status}`);
+      return null;
+    }
     return await resp.json();
-  } catch {
+  } catch (e) {
+    log(`⚠️ Supabase query to ${table} failed: ${(e as Error).message}`);
     return null;
   }
 }
@@ -335,12 +407,14 @@ interface MarketInfo {
   oracleMode?: string;
   /** DEX pool address for HYPERP markets — from Supabase dex_pool_address column */
   dexPoolAddress?: string;
+  isDynamic?: boolean;
 }
 
 interface MarketStats {
   symbol: string;
   lastPrice: number;
   lastPushAt: number;       // epoch ms
+  lastFreshPriceAt: number;  // epoch ms of last successful live-source push
   lastPushSig: string;
   totalPushes: number;
   totalErrors: number;
@@ -350,6 +424,12 @@ interface MarketStats {
 }
 
 // ── Price Sources ───────────────────────────────────────────
+
+type PriceResult = {
+  price: number;
+  source: string;
+  freshAt: number;
+};
 
 // Pyth Network feed IDs (hex, without 0x prefix) — universal across all chains
 const PYTH_FEED_IDS: Record<string, string> = {
@@ -437,12 +517,12 @@ async function fetchPythPrices(symbols: string[]): Promise<void> {
   }
 }
 
-function getPythPrice(symbol: string): number | null {
+function getPythPrice(symbol: string): { price: number; freshAt: number } | null {
   const cached = pythCache.get(symbol);
   if (!cached) return null;
   // Reject if older than 30s
   if (Date.now() - cached.ts > 30_000) return null;
-  return cached.price;
+  return { price: cached.price, freshAt: cached.ts };
 }
 
 /** Jupiter price fallback (uses mint addresses) */
@@ -479,21 +559,29 @@ async function fetchDexScreenerPrice(symbol: string): Promise<number | null> {
   } catch { return null; }
 }
 
-/** Fetch price with multi-source failover: Pyth → Jupiter → DexScreener → CA lookup */
-async function getPrice(symbol: string, slab?: string): Promise<{ price: number; source: string } | null> {
-  // Primary: Pyth (decentralized oracle, fastest for supported tokens)
-  const pyth = getPythPrice(symbol);
-  if (pyth) return { price: pyth, source: "pyth" };
+/** Fetch price with multi-source failover: CA lookup for mapped dynamic markets → Pyth → Jupiter → DexScreener */
+const ALLOWED_STATIC_SYMBOLS = new Set<string>(Object.keys(PYTH_FEED_IDS).concat(Object.keys(JUPITER_MINTS)));
 
-  // Secondary: Jupiter (Solana DEX aggregator, uses mint addresses)
-  const jup = await fetchJupiterPrice(symbol);
-  if (jup) return { price: jup, source: "jupiter" };
+/** Fetch price with multi-source failover: CA lookup for mapped dynamic markets → Pyth → Jupiter → DexScreener */
+async function getPrice(
+  symbol: string,
+  slab?: string,
+  isDynamic?: boolean,
+): Promise<PriceResult | null> {
+  // If the market is dynamic, bypass symbol-based lookups completely to prevent oracle confusion. (HIGH-004)
+  // Dynamic markets must resolve strictly through their contract address (mainnet_ca).
+  if (isDynamic) {
+    if (slab) {
+      const ca = slabToMainnetCA.get(slab);
+      if (ca) {
+        return fetchPriceByCA(ca);
+      }
+    }
+    return null;
+  }
 
-  // Tertiary: DexScreener (broad coverage for exotic tokens)
-  const dex = await fetchDexScreenerPrice(symbol);
-  if (dex) return { price: dex, source: "dexscreener" };
-
-  // Quaternary: Direct CA lookup for dynamic markets (PERC-465)
+  // Non-dynamic: CA-first routing for markets with a known mainnet_ca mapping.
+  // This ensures symbol→wrong-asset confusion is avoided even for non-isDynamic markets.
   if (slab) {
     const ca = slabToMainnetCA.get(slab);
     if (ca) {
@@ -501,6 +589,24 @@ async function getPrice(symbol: string, slab?: string): Promise<{ price: number;
       if (caPrice) return caPrice;
     }
   }
+
+  // Security hardening: Restrict static symbols to a known safe allowlist to prevent confusion (HIGH-004)
+  if (!ALLOWED_STATIC_SYMBOLS.has(symbol)) {
+    log(`⚠️ getPrice: rejected unknown static symbol lookup for "${symbol}"`);
+    return null;
+  }
+
+  // Primary: Pyth (decentralized oracle, fastest for supported tokens)
+  const pyth = getPythPrice(symbol);
+  if (pyth) return { price: pyth.price, source: "pyth", freshAt: pyth.freshAt };
+
+  // Secondary: Jupiter (Solana DEX aggregator, uses mint addresses)
+  const jup = await fetchJupiterPrice(symbol);
+  if (jup) return { price: jup, source: "jupiter", freshAt: Date.now() };
+
+  // Tertiary: DexScreener (broad coverage for exotic tokens)
+  const dex = await fetchDexScreenerPrice(symbol);
+  if (dex) return { price: dex, source: "dexscreener", freshAt: Date.now() };
 
   return null;
 }
@@ -538,6 +644,7 @@ function getOrCreateStats(market: MarketInfo): MarketStats {
       symbol: market.symbol,
       lastPrice: 0,
       lastPushAt: 0,
+      lastFreshPriceAt: 0,
       lastPushSig: "",
       totalPushes: 0,
       totalErrors: 0,
@@ -673,7 +780,7 @@ async function pushAndCrank(market: MarketInfo, programId: PublicKey): Promise<v
       // slab's on-chain owner program. Dynamic markets discovered via Supabase
       // may be owned by a different deployed program than the one in
       // deployment.json (e.g. old FwfB... vs current FxfD...).
-      const slabInfo = await conn.getAccountInfo(new PublicKey(market.slab));
+      const slabInfo = await getAccountInfoWithTimeout(conn, new PublicKey(market.slab));
       if (!slabInfo) throw new Error(`Slab account not found: ${market.slab}`);
       const slabData = new Uint8Array(slabInfo.data);
       const cfg = parseConfig(slabData);
@@ -698,23 +805,34 @@ async function pushAndCrank(market: MarketInfo, programId: PublicKey): Promise<v
     }
   }
 
-  const result = await getPrice(market.symbol, market.slab);
+  const result = await getPrice(market.symbol, market.slab, market.isDynamic);
 
-  // Resolve price: live source preferred, fall back to last known price when all
-  // external sources return null or zero (e.g. devnet token with no DEX pool).
-  // Without a fallback the on-chain oracle stays at 0, the UI freshness check marks
-  // the market "unavailable", and trading is blocked even though a valid price exists
-  // from a previous push.  This is safe: the circuit breaker below will still reject
-  // moves > MAX_PRICE_MOVE_PCT, and s.lastPrice is only set after a successful push.
+  // Resolve price: live source preferred. A last-known fallback is only allowed
+  // while the previous successful push is still within the freshness threshold.
+  // This avoids re-publishing stale cached prices with fresh oracle timestamps when
+  // all live price sources fail.
   let price: number;
   let source: string;
+  let freshPriceAt: number | null = null;
 
   if (result && isPriceValid(result.price)) {
     price = result.price;
     source = result.source;
+    freshPriceAt = result.freshAt;
   } else if (s.lastPrice > 0) {
-    // Devnet / no-pool fallback: use last successfully pushed price to keep oracle alive.
-    // Logged clearly so ops know the market is running on cached data.
+    // Devnet / transient no-pool fallback: reuse the last successfully pushed
+    // live-source price only while it remains within the freshness threshold.
+    const lastKnownAgeSec = s.lastFreshPriceAt
+      ? Math.floor((Date.now() - s.lastFreshPriceAt) / 1000)
+      : Infinity;
+
+    if (lastKnownAgeSec > STALE_THRESHOLD_S) {
+      s.totalErrors++;
+      s.consecutiveErrors++;
+      log(`No fresh price available for ${market.symbol}; last-known price is stale (${lastKnownAgeSec}s), skipping push`);
+      return;
+    }
+
     price = s.lastPrice;
     source = "last-known";
     if (!result) {
@@ -780,6 +898,9 @@ async function pushAndCrank(market: MarketInfo, programId: PublicKey): Promise<v
 
   s.lastPrice = price;
   s.lastPushAt = Date.now();
+  if (freshPriceAt !== null) {
+    s.lastFreshPriceAt = freshPriceAt;
+  }
   s.lastPushSig = sig;
   s.totalPushes++;
   s.consecutiveErrors = 0;
@@ -821,14 +942,27 @@ async function updateHyperpMark(
   const effectiveProgramId = slabProgramId.get(market.slab) ?? programId;
 
   // Resolve (and cache) pool meta + extra accounts
+const ALLOWED_POOL_PROGRAMS = new Set<string>([
+  "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA", // PumpSwap
+  "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK", // Raydium CLMM
+  "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo", // Meteora DLMM
+]);
+
   let poolMeta = hyperpPoolCache.get(market.slab);
   if (!poolMeta) {
     const poolPk = new PublicKey(market.dexPoolAddress);
-    const poolInfo = await conn.getAccountInfo(poolPk);
+    const poolInfo = await getAccountInfoWithTimeout(conn, poolPk);
     if (!poolInfo) {
       log(`⚠️ ${market.label}: DEX pool account not found: ${market.dexPoolAddress}`);
       return;
     }
+
+    // Security check: ensure the pool is owned by an allowed DEX program (HIGH-001)
+    if (!ALLOWED_POOL_PROGRAMS.has(poolInfo.owner.toBase58())) {
+      log(`⚠️ ${market.label}: pool owned by unknown program ${poolInfo.owner.toBase58()} — rejecting`);
+      return;
+    }
+
     const extraAccounts: PublicKey[] = [];
     // PumpSwap pools carry vault addresses in their account data layout
     const dexType = detectDexType(poolInfo.owner);
@@ -906,13 +1040,14 @@ function startHealthServer() {
       const now = Date.now();
       const uptimeS = Math.floor((now - startTime) / 1000);
       const markets: Record<string, any> = {};
+      const marketsBySlab: Record<string, unknown> = {};
       let healthy = true;
 
       for (const [slab, s] of stats) {
         const staleSec = s.lastPushAt ? Math.floor((now - s.lastPushAt) / 1000) : -1;
         const isStale = staleSec > STALE_THRESHOLD_S;
         if (isStale) healthy = false;
-        markets[s.symbol] = {
+        const marketHealth = {
           lastPrice: s.lastPrice,
           lastPushAgo: `${staleSec}s`,
           stale: isStale,
@@ -921,6 +1056,11 @@ function startHealthServer() {
           totalErrors: s.totalErrors,
           consecutiveErrors: s.consecutiveErrors,
           circuitBreakerTrips: s.circuitBreakerTrips,
+        };
+        markets[s.symbol] = marketHealth;
+        marketsBySlab[slab] = {
+          symbol: s.symbol,
+          ...marketHealth,
         };
       }
 
@@ -938,6 +1078,7 @@ function startHealthServer() {
           low: walletLow,
         },
         markets,
+        marketsBySlab,
       }, null, 2);
 
       res.writeHead(healthy ? 200 : 503, { "Content-Type": "application/json" });
@@ -980,6 +1121,16 @@ let markets: MarketInfo[] = [];
 // detect when they're disabled and downgrade them back to admin oracle mode.
 const hyperpFromOracleTable = new Set<string>();
 
+/**
+ * Discovers HYPERP markets from the Supabase oracle_markets table.
+ *
+ * This keeps already-tracked slabs synchronized with oracle_markets by:
+ * - upgrading non-HYPERP markets to HYPERP mode when an override is enabled
+ * - refreshing dexPoolAddress when an existing HYPERP pool override changes
+ * - invalidating cached HYPERP pool metadata after pool updates
+ *
+ * @returns Newly discovered HYPERP markets that should be added to the keeper.
+ */
 async function discoverHyperpFromOracleTable(): Promise<MarketInfo[]> {
   if (!supabaseEnabled) return [];
   try {
@@ -1017,13 +1168,20 @@ async function discoverHyperpFromOracleTable(): Promise<MarketInfo[]> {
       if (!row.enabled || !row.slab_address || !row.dex_pool_address) continue;
 
       if (knownSlabs.has(row.slab_address)) {
-        // Upgrade an already-tracked market from admin/pyth → hyperp
+        // Upgrade an already-tracked market from admin/pyth → hyperp, or refresh
+        // the pool override when oracle_markets changes dex_pool_address.
         const existing = markets.find(m => m.slab === row.slab_address);
-        if (existing && existing.oracleMode !== "hyperp") {
-          log(`🔄 ${existing.label}: oracle_markets override → hyperp (pool=${row.dex_pool_address.slice(0, 12)}...)`);
-          existing.oracleMode = "hyperp";
-          existing.dexPoolAddress = row.dex_pool_address;
-          hyperpPoolCache.delete(row.slab_address); // force re-fetch with new pool
+        if (existing) {
+          if (existing.oracleMode !== "hyperp") {
+            log(`🔄 ${existing.label}: oracle_markets override → hyperp (pool=${row.dex_pool_address.slice(0, 12)}...)`);
+            existing.oracleMode = "hyperp";
+            existing.dexPoolAddress = row.dex_pool_address;
+            hyperpPoolCache.delete(row.slab_address); // force re-fetch with new pool
+          } else if (existing.dexPoolAddress !== row.dex_pool_address) {
+            log(`🔄 ${existing.label}: oracle_markets pool updated ${existing.dexPoolAddress?.slice(0, 12) ?? "none"}... → ${row.dex_pool_address.slice(0, 12)}...`);
+            existing.dexPoolAddress = row.dex_pool_address;
+            hyperpPoolCache.delete(row.slab_address); // invalidate stale pool metadata
+          }
         }
         hyperpFromOracleTable.add(row.slab_address);
         continue;
@@ -1037,6 +1195,7 @@ async function discoverHyperpFromOracleTable(): Promise<MarketInfo[]> {
         slab: row.slab_address,
         oracleMode: "hyperp",
         dexPoolAddress: row.dex_pool_address ?? undefined,
+        isDynamic: true,
       });
     }
 
@@ -1083,6 +1242,7 @@ async function discoverNewMarkets(): Promise<MarketInfo[]> {
         slab: row.slab_address,
         oracleMode,
         dexPoolAddress: row.dex_pool_address ?? undefined,
+        isDynamic: true,
       });
     }
     return newMarkets;
@@ -1097,7 +1257,7 @@ async function discoverNewMarkets(): Promise<MarketInfo[]> {
  * since they may not be in PYTH_FEED_IDS or JUPITER_MINTS.
  * This fetches price directly using the mainnet CA via Jupiter Lite API.
  */
-async function fetchPriceByCA(mainnetCA: string): Promise<{ price: number; source: string } | null> {
+async function fetchPriceByCA(mainnetCA: string): Promise<PriceResult | null> {
   // Validate as base58 Solana address before using in external URLs (#783, #784)
   if (!/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(mainnetCA)) return null;
   const encoded = encodeURIComponent(mainnetCA);
@@ -1111,7 +1271,7 @@ async function fetchPriceByCA(mainnetCA: string): Promise<{ price: number; sourc
     const data = json.data?.[mainnetCA];
     if (data?.price) {
       const p = parseFloat(data.price);
-      if (isFinite(p) && p > 0) return { price: p, source: "jupiter-ca" };
+      if (isFinite(p) && p > 0) return { price: p, source: "jupiter-ca", freshAt: Date.now() };
     }
   } catch {}
 
@@ -1125,7 +1285,7 @@ async function fetchPriceByCA(mainnetCA: string): Promise<{ price: number; sourc
     const pair = json.pairs?.[0];
     if (pair?.priceUsd) {
       const p = parseFloat(pair.priceUsd);
-      if (isFinite(p) && p > 0) return { price: p, source: "dexscreener-ca" };
+      if (isFinite(p) && p > 0) return { price: p, source: "dexscreener-ca", freshAt: Date.now() };
     }
   } catch {}
 
@@ -1176,8 +1336,37 @@ async function main() {
     process.exit(1);
   }
 
-  const deploy = deployRaw ? JSON.parse(deployRaw) : { programId: process.env.PROGRAM_ID, markets: [] };
-  const programId = new PublicKey(deploy.programId);
+  let deploy: any;
+  try {
+    deploy = deployRaw ? JSON.parse(deployRaw) : { programId: process.env.PROGRAM_ID, markets: [] };
+  } catch (parseErr) {
+    console.error("❌ Failed to parse deployment JSON:", parseErr instanceof Error ? parseErr.message : String(parseErr));
+    process.exit(1);
+  }
+
+  if (!deploy || typeof deploy.programId !== "string") {
+    console.error("❌ Invalid deployment JSON: programId must be a string");
+    process.exit(1);
+  }
+
+  // Validate base58 programId format (43-44 characters) (MED-002)
+  if (!/^[1-9A-HJ-NP-Za-km-z]{43,44}$/.test(deploy.programId)) {
+    console.error(`❌ Invalid programId format: "${deploy.programId}" (must be 43-44 base58 characters)`);
+    process.exit(1);
+  }
+
+  let programId: PublicKey;
+  try {
+    programId = new PublicKey(deploy.programId);
+  } catch (err) {
+    console.error(`❌ Failed to construct programId PublicKey: ${err instanceof Error ? err.message : String(err)}`);
+    process.exit(1);
+  }
+
+  if (!Array.isArray(deploy.markets)) {
+    deploy.markets = [];
+  }
+
   // Assign to module-level `markets` so discovery functions can access it.
   markets = (deploy.markets as MarketInfo[]).filter(m => {
     if (ORACLE_KEEPER_BLOCKED_MARKETS.has(m.slab)) {
@@ -1195,10 +1384,10 @@ async function main() {
   log(`Verifying oracle authority for ${markets.length} market(s)...`);
   for (const m of markets) {
     try {
-      // Use getAccountInfo directly to capture both slab data and program owner.
+      // Use getAccountInfo with timeout to capture both slab data and program owner. (LOW-003)
       // The owner is cached in slabProgramId and used when building instructions,
       // preventing "Provided owner is not allowed" for markets on different program tiers.
-      const slabInfo = await conn.getAccountInfo(new PublicKey(m.slab));
+      const slabInfo = await getAccountInfoWithTimeout(conn, new PublicKey(m.slab));
       if (!slabInfo) throw new Error(`Slab account not found`);
       const slabData = new Uint8Array(slabInfo.data);
       const cfg = parseConfig(slabData);
@@ -1293,7 +1482,7 @@ async function main() {
             getOrCreateStats(m);
             // Verify oracle authority for new market
             try {
-              const slabInfo = await conn.getAccountInfo(new PublicKey(m.slab));
+              const slabInfo = await getAccountInfoWithTimeout(conn, new PublicKey(m.slab));
               if (!slabInfo) throw new Error(`Slab account not found`);
               const slabData = new Uint8Array(slabInfo.data);
               const cfg = parseConfig(slabData);
