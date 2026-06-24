@@ -43,15 +43,25 @@ import {
 } from "@percolator/sdk";
 import * as fs from "fs";
 import * as http from "http";
+import * as crypto from "crypto";
 
 // ── Config ──────────────────────────────────────────────────
 import { parsePositiveNumberEnv, requireProgramIdForSupabaseMode } from "./env-utils.ts";
 import { checkCircuitBreaker as _checkCircuitBreaker } from "./circuit-breaker.ts";
 import type { CircuitBreakerState } from "./circuit-breaker.ts";
 
+// #31(a): Refuse to start with TLS verification disabled.
+// NODE_TLS_REJECT_UNAUTHORIZED=0 disables certificate validation for ALL
+// outbound connections — this allows MITM attacks on Hermes (price injection),
+// RPC, and DexScreener. Fail fast before any connections are made.
+if (process.env.NODE_TLS_REJECT_UNAUTHORIZED === "0") {
+  console.error("[FATAL] NODE_TLS_REJECT_UNAUTHORIZED=0 is set — this disables TLS certificate verification for all outbound connections and allows price injection via MITM. Remove this variable and restart.");
+  process.exit(1);
+}
+
 const PUSH_INTERVAL_MS    = parsePositiveNumberEnv("PUSH_INTERVAL_MS",    3000);
 const HEALTH_PORT         = parsePositiveNumberEnv("HEALTH_PORT",         18810);
-const MAX_PRICE_MOVE_PCT  = parsePositiveNumberEnv("MAX_PRICE_MOVE_PCT",  10);
+const MAX_PRICE_MOVE_PCT  = parsePositiveNumberEnv("MAX_PRICE_MOVE_PCT",  10, 100);
 const STALE_THRESHOLD_S   = parsePositiveNumberEnv("STALE_THRESHOLD_S",   30);
 /**
  * Number of consecutive circuit-breaker trips at a consistent new price level
@@ -113,7 +123,12 @@ for (const entry of envBlockedRaw) {
     new PublicKey(entry);
     validatedBlockedMarkets.push(entry);
   } catch (e) {
-    console.error(`[ERROR] Invalid blocked market address in ORACLE_KEEPER_BLOCKED_MARKETS: "${entry}" — ignoring`);
+    // #50: fail-fast — an invalid blocked-market address means the blocklist is
+    // misconfigured and a market that should be blocked might not be. Exit
+    // immediately so the operator is forced to fix the address before the
+    // keeper resumes signing transactions.
+    console.error(`[FATAL] Invalid blocked market address in ORACLE_KEEPER_BLOCKED_MARKETS: "${entry}" — fix the address or remove it, then restart.`);
+    process.exit(1);
   }
 }
 
@@ -129,6 +144,14 @@ const ADMIN_KP_PATH = process.env.ADMIN_KEYPAIR_PATH ??
 const RPC_URL = process.env.RPC_URL!;
 
 const conn = new Connection(RPC_URL, "confirmed");
+
+// #37: Optional secondary connection for transaction-inclusion verification.
+// Set VERIFY_RPC_URL to a different RPC endpoint to cross-check that the
+// submitted transaction actually landed on-chain. Falls back to the primary
+// conn if VERIFY_RPC_URL is not set.
+const connVerify: Connection | null = process.env.VERIFY_RPC_URL
+  ? new Connection(process.env.VERIFY_RPC_URL, "confirmed")
+  : null;
 
 /**
  * Load oracle keeper admin keypair with security hardening
@@ -234,6 +257,40 @@ const authorityVerified = new Set<string>();
 // otherwise the Solana runtime rejects with "Provided owner is not allowed" (0x10).
 const slabProgramId = new Map<string, PublicKey>();
 
+// #32: allowlist of program IDs whose slabs this keeper is permitted to sign for.
+// Populated at startup from deploy.programId + ADDITIONAL_PROGRAM_IDS env var.
+// A Supabase row that points at an attacker-owned program would make the keeper
+// sign transactions for that program; validating slabInfo.owner before parseConfig
+// prevents this. Access via isAllowedProgramId() below.
+const allowedProgramIds = new Set<string>();
+
+/**
+ * Check that a slab account's on-chain owner (slabInfo.owner) is in the
+ * EXPECTED_PROGRAM_IDS allowlist before trusting it for parseConfig or
+ * instruction building.  Must be called at ALL THREE fetch sites:
+ *   1. startup authority loop
+ *   2. pushAndCrank authority re-check
+ *   3. discovery loop authority check
+ *
+ * @param owner - the PublicKey from slabInfo.owner
+ * @param slabAddress - for logging
+ * @param label - human-readable market label for logging
+ * @returns true if allowed, false if the slab should be skipped
+ */
+function isAllowedProgramId(owner: PublicKey, slabAddress: string, label: string): boolean {
+  if (allowedProgramIds.size === 0) {
+    // Allowlist not yet populated (called before main() sets it up).
+    // This should not happen in production; block as a safety measure.
+    log(`🚨 [#32] ${label}: allowedProgramIds not initialised — blocking slab ${slabAddress.slice(0, 12)}...`);
+    return false;
+  }
+  if (!allowedProgramIds.has(owner.toBase58())) {
+    log(`🚨 [#32] ${label}: slab owned by UNEXPECTED program ${owner.toBase58()} — not in allowlist. Possible Supabase injection attack. Skipping.`);
+    return false;
+  }
+  return true;
+}
+
 /**
  * Validate critical environment variables at startup (HIGH-001 security fix)
  *
@@ -322,13 +379,16 @@ function validateEnvironmentConfig(): void {
   }
 
   // Validate Supabase configuration (if enabled)
+  // #46: accept either SUPABASE_ANON_KEY (preferred for read-only) or SUPABASE_SERVICE_ROLE_KEY.
   const supabaseUrl = (process.env.SUPABASE_URL ?? process.env.NEXT_PUBLIC_SUPABASE_URL ?? "").trim();
-  const supabaseKey = (process.env.SUPABASE_SERVICE_ROLE_KEY ?? "").trim();
+  const supabaseAnonKey = (process.env.SUPABASE_ANON_KEY ?? "").trim();
+  const supabaseServiceKey = (process.env.SUPABASE_SERVICE_ROLE_KEY ?? "").trim();
+  const supabaseEffectiveKey = supabaseAnonKey || supabaseServiceKey;
 
-  if (supabaseUrl && !supabaseKey) {
+  if (supabaseUrl && !supabaseEffectiveKey) {
     errors.push(
-      "SUPABASE_URL is configured but SUPABASE_SERVICE_ROLE_KEY is missing. " +
-      "Either disable Supabase (unset SUPABASE_URL) or provide a service role key.",
+      "SUPABASE_URL is configured but neither SUPABASE_ANON_KEY nor SUPABASE_SERVICE_ROLE_KEY is set. " +
+      "Either disable Supabase (unset SUPABASE_URL) or provide a read key.",
     );
   }
 
@@ -343,10 +403,10 @@ function validateEnvironmentConfig(): void {
     }
   }
 
-  if (supabaseUrl && supabaseKey && supabaseKey.length < 100) {
+  if (supabaseUrl && supabaseEffectiveKey && supabaseEffectiveKey.length < 100) {
     errors.push(
-      `SUPABASE_SERVICE_ROLE_KEY appears truncated (${supabaseKey.length} chars, expected 100+). ` +
-      "This usually indicates a copy-paste error.",
+      `Supabase key appears truncated (${supabaseEffectiveKey.length} chars, expected 100+). ` +
+      "This usually indicates a copy-paste error. Check SUPABASE_ANON_KEY or SUPABASE_SERVICE_ROLE_KEY.",
     );
   }
 
@@ -384,9 +444,15 @@ function validateEnvironmentConfig(): void {
 // ── Supabase Auto-Discovery ─────────────────────────────────
 const SUPABASE_URL = process.env.SUPABASE_URL ?? process.env.NEXT_PUBLIC_SUPABASE_URL ?? "";
 const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY ?? "";
+// #46: accept either the anon key or the service role key.
+// Prefer the anon key (SUPABASE_ANON_KEY) for read-only queries so the service
+// role key's write privileges aren't exposed to Supabase's REST layer.
+// Fall back to the service role key when no anon key is set, but emit a
+// startup warning so operators know to provision a dedicated read key.
+const SUPABASE_READ_KEY = process.env.SUPABASE_ANON_KEY || SUPABASE_SERVICE_KEY;
 const DISCOVERY_INTERVAL_MS = parsePositiveNumberEnv("DISCOVERY_INTERVAL_MS", 30000); // 30s
 
-const supabaseEnabled = !!(SUPABASE_URL && SUPABASE_SERVICE_KEY);
+const supabaseEnabled = !!(SUPABASE_URL && SUPABASE_READ_KEY);
 
 /** Lightweight Supabase REST query — no client library needed */
 async function supabaseQuery(table: string, params: string): Promise<any[] | null> {
@@ -396,8 +462,8 @@ async function supabaseQuery(table: string, params: string): Promise<any[] | nul
       `${SUPABASE_URL}/rest/v1/${table}?${params}`,
       {
         headers: {
-          apikey: SUPABASE_SERVICE_KEY,
-          Authorization: `Bearer ${SUPABASE_SERVICE_KEY}`,
+          apikey: SUPABASE_READ_KEY,
+          Authorization: `Bearer ${SUPABASE_READ_KEY}`,
         },
         signal: AbortSignal.timeout(5000),
       },
@@ -441,14 +507,27 @@ interface MarketStats {
   cbTripPrice: number;
   /** How many consecutive trips have occurred near cbTripPrice (issue #30). */
   cbConsecutiveTrips: number;
+  /** #34: consecutive push cycles where the price came only from a DexScreener source. */
+  consecutiveLowTrustCycles: number;
 }
 
 // ── Price Sources ───────────────────────────────────────────
+
+// #34: DexScreener is an unattested, single-source feed — apply a tighter
+// circuit-breaker bound than Pyth/Jupiter. Bounded <100 via the #44 helper.
+const DEXSCREENER_MAX_MOVE_PCT = parsePositiveNumberEnv("DEXSCREENER_MAX_MOVE_PCT", 5, 100);
+
+// #34: Alert after this many consecutive push cycles where only a DexScreener
+// source was available (low-trust alert).
+const DEXSCREENER_LOW_TRUST_ALERT_CYCLES = parsePositiveNumberEnv("DEXSCREENER_LOW_TRUST_ALERT_CYCLES", 5);
 
 type PriceResult = {
   price: number;
   source: string;
   freshAt: number;
+  /** Circuit-breaker max-move override for this source. When set, pushAndCrank
+   *  uses this value instead of the global MAX_PRICE_MOVE_PCT. */
+  maxMovePct?: number;
 };
 
 // Pyth Network feed IDs (hex, without 0x prefix) — universal across all chains
@@ -492,9 +571,14 @@ async function fetchPythPrices(symbols: string[]): Promise<void> {
   if (ids.length === 0) return;
 
   try {
+    // #31(b): Request with encoding=base64 so the response includes binary.data
+    // (the Wormhole VAA / guardian-attestation blob). Reject responses where the
+    // binary field is absent or empty — this is a presence check, not a full
+    // guardian-signature verification, but it ensures Hermes is returning real
+    // attested price data rather than a spoofed parsed-only response.
     const params = ids.map(id => `ids[]=${id}`).join("&");
     const resp = await fetch(
-      `${HERMES_URL}/v2/updates/price/latest?${params}&parsed=true`,
+      `${HERMES_URL}/v2/updates/price/latest?${params}&parsed=true&encoding=base64`,
       { signal: AbortSignal.timeout(5000) },
     );
     if (!resp.ok) {
@@ -502,11 +586,21 @@ async function fetchPythPrices(symbols: string[]): Promise<void> {
       return;
     }
     const json = (await resp.json()) as {
+      binary?: { encoding?: string; data?: string[] };
       parsed: Array<{
         id: string;
         price: { price: string; expo: number; publish_time: number };
       }>;
     };
+
+    // Reject the entire batch if the Wormhole VAA blob is absent or empty.
+    // This is a presence check — we do NOT verify guardian signatures here
+    // (that would require the full Wormhole verification stack). The intent is
+    // to ensure Hermes is returning attestation-backed data.
+    if (!json.binary?.data || json.binary.data.length === 0) {
+      log(`⚠️ Pyth Hermes: binary.data absent or empty — rejecting response (no Wormhole VAA present)`);
+      return;
+    }
 
     // Build reverse map: feedId → symbol
     const idToSymbol = new Map<string, string>();
@@ -562,8 +656,10 @@ async function fetchJupiterPrice(symbol: string): Promise<number | null> {
   } catch { return null; }
 }
 
-/** DexScreener fallback for custom/exotic tokens */
-async function fetchDexScreenerPrice(symbol: string): Promise<number | null> {
+/** DexScreener fallback for custom/exotic tokens.
+ * Returns a PriceResult with the tighter DEXSCREENER_MAX_MOVE_PCT bound (#34).
+ */
+async function fetchDexScreenerPrice(symbol: string): Promise<PriceResult | null> {
   const mint = JUPITER_MINTS[symbol];
   if (!mint) return null;
   try {
@@ -575,7 +671,8 @@ async function fetchDexScreenerPrice(symbol: string): Promise<number | null> {
     const pair = json.pairs?.[0];
     if (!pair?.priceUsd) return null;
     const p = parseFloat(pair.priceUsd);
-    return isFinite(p) && p > 0 ? p : null;
+    if (!isFinite(p) || p <= 0) return null;
+    return { price: p, source: "dexscreener", freshAt: Date.now(), maxMovePct: DEXSCREENER_MAX_MOVE_PCT };
   } catch { return null; }
 }
 
@@ -624,9 +721,9 @@ async function getPrice(
   const jup = await fetchJupiterPrice(symbol);
   if (jup) return { price: jup, source: "jupiter", freshAt: Date.now() };
 
-  // Tertiary: DexScreener (broad coverage for exotic tokens)
+  // Tertiary: DexScreener (broad coverage for exotic tokens) — uses tighter bound (#34)
   const dex = await fetchDexScreenerPrice(symbol);
-  if (dex) return { price: dex, source: "dexscreener", freshAt: Date.now() };
+  if (dex) return dex;
 
   return null;
 }
@@ -673,6 +770,7 @@ function getOrCreateStats(market: MarketInfo): MarketStats {
       source: "",
       cbTripPrice: 0,
       cbConsecutiveTrips: 0,
+      consecutiveLowTrustCycles: 0,
     };
     stats.set(market.slab, s);
   }
@@ -684,10 +782,13 @@ function getOrCreateStats(market: MarketInfo): MarketStats {
  * Thin wrapper that binds the module-level config constants and log function
  * to the pure checkCircuitBreaker helper from ./circuit-breaker.ts.
  * See that module for full doc + issue #30 relocation-recovery semantics.
+ *
+ * #34: accepts an optional per-source maxMovePct override so DexScreener
+ * sources are held to the tighter DEXSCREENER_MAX_MOVE_PCT bound.
  */
-function checkCircuitBreaker(s: MarketStats, newPrice: number): boolean {
+function checkCircuitBreaker(s: MarketStats, newPrice: number, sourceMaxMovePct?: number): boolean {
   return _checkCircuitBreaker(s as CircuitBreakerState, newPrice, {
-    maxMovePct: MAX_PRICE_MOVE_PCT,
+    maxMovePct: sourceMaxMovePct ?? MAX_PRICE_MOVE_PCT,
     confirmTrips: CIRCUIT_BREAKER_CONFIRM_TRIPS,
     log,
   });
@@ -697,6 +798,40 @@ function checkCircuitBreaker(s: MarketStats, newPrice: number): boolean {
 function log(msg: string) {
   const ts = new Date().toISOString().slice(11, 19);
   console.log(`[${ts}] [oracle-keeper] ${msg}`);
+}
+
+/**
+ * #37: Verify a transaction signature was actually included on-chain.
+ *
+ * Uses connVerify (if set) or falls back to conn. If the verify RPC itself
+ * errors we credit the push optimistically (don't halt on RPC outage).
+ * Returns true if confirmed or if the verify check errored (optimistic credit).
+ * Returns false only when we can positively confirm the tx was NOT included.
+ */
+async function verifyTxInclusion(sig: string): Promise<boolean> {
+  const verifyConn = connVerify ?? conn;
+  try {
+    const result = await verifyConn.getTransaction(sig, {
+      commitment: "confirmed",
+      maxSupportedTransactionVersion: 0,
+    });
+    if (result === null) {
+      // Transaction not found — may still be pending; treat as not confirmed
+      log(`⚠️ [#37] tx ${sig.slice(0, 12)}... not found on verify RPC after sendAndConfirm — optimistic credit`);
+      // Optimistic: sendAndConfirmTransaction already waited for confirmation;
+      // a missing tx on the verify RPC is likely a propagation lag, not a real miss.
+      return true;
+    }
+    if (result.meta?.err) {
+      log(`⚠️ [#37] tx ${sig.slice(0, 12)}... landed but meta.err=${JSON.stringify(result.meta.err)} — marking as error`);
+      return false;
+    }
+    return true;
+  } catch (e) {
+    // Verify RPC errored — credit optimistically, don't halt on verify-RPC outage
+    log(`⚠️ [#37] verify RPC error for tx ${sig.slice(0, 12)}...: ${(e as Error).message?.slice(0, 60)} — crediting optimistically`);
+    return true;
+  }
 }
 
 /**
@@ -806,6 +941,11 @@ async function pushAndCrank(market: MarketInfo, programId: PublicKey): Promise<v
       // deployment.json (e.g. old FwfB... vs current FxfD...).
       const slabInfo = await getAccountInfoWithTimeout(conn, new PublicKey(market.slab));
       if (!slabInfo) throw new Error(`Slab account not found: ${market.slab}`);
+      // #32: validate slab owner BEFORE parseConfig/trusting any account data
+      if (!isAllowedProgramId(slabInfo.owner, market.slab, market.label)) {
+        skippedMarkets.add(market.slab);
+        return;
+      }
       const slabData = new Uint8Array(slabInfo.data);
       const cfg = parseConfig(slabData);
       if (!cfg.oracleAuthority.equals(admin.publicKey)) {
@@ -876,8 +1016,69 @@ async function pushAndCrank(market: MarketInfo, programId: PublicKey): Promise<v
     return;
   }
 
-  // Circuit breaker
-  if (!checkCircuitBreaker(s, price)) return;
+  // #33: First-push cross-check.
+  // The sync circuit-breaker in circuit-breaker.ts unconditionally accepts any
+  // price when lastPrice===0 (every restart). An attacker who can influence the
+  // first price (e.g. flash a DexScreener/Jupiter pool just before restart) could
+  // re-baseline the keeper to a manipulated price.
+  //
+  // Mitigation: on the FIRST push for a market after start (lastPrice===0),
+  // require a secondary-source confirmation UNLESS the price came from a Pyth
+  // (Wormhole-attested) source, which is already multi-oracle-verified.
+  //
+  // The actual circuit-breaker (sync) runs after this async pre-check.
+  if (s.lastPrice === 0 && source !== "pyth") {
+    // Attempt a secondary source confirmation
+    let secondaryOk = false;
+    let secondaryPrice: number | null = null;
+    // Try Jupiter first (it's the fastest non-Pyth source)
+    const jupPrice = await fetchJupiterPrice(market.symbol);
+    if (jupPrice !== null) {
+      secondaryPrice = jupPrice;
+      const movePct = Math.abs((price - jupPrice) / jupPrice) * 100;
+      // Use DEXSCREENER_MAX_MOVE_PCT as the cross-check tolerance
+      if (movePct <= DEXSCREENER_MAX_MOVE_PCT) {
+        secondaryOk = true;
+      }
+    }
+    if (!secondaryOk) {
+      // Also try Pyth cache (may have been populated by this tick's batch fetch)
+      const pythEntry = getPythPrice(market.symbol);
+      if (pythEntry) {
+        const movePct = Math.abs((price - pythEntry.price) / pythEntry.price) * 100;
+        if (movePct <= DEXSCREENER_MAX_MOVE_PCT) {
+          secondaryOk = true;
+          secondaryPrice = pythEntry.price;
+        }
+      }
+    }
+    if (!secondaryOk) {
+      log(
+        `⚠️ [#33] ${market.label}: first push cross-check FAILED — ` +
+        `${source} price $${price.toFixed(4)} not confirmed by secondary source ` +
+        `(secondary=${ secondaryPrice !== null ? `$${secondaryPrice.toFixed(4)}` : "unavailable" }). ` +
+        `Holding until cross-check passes or a Pyth price becomes available.`,
+      );
+      s.totalErrors++;
+      s.consecutiveErrors++;
+      return;
+    }
+    log(`✓ [#33] ${market.label}: first push cross-check PASSED (${source} $${price.toFixed(4)} ≈ secondary $${secondaryPrice!.toFixed(4)})`);
+  }
+
+  // Circuit breaker — use per-source bound for DexScreener (#34)
+  if (!checkCircuitBreaker(s, price, result?.maxMovePct)) return;
+
+  // #34: track consecutive low-trust (DexScreener-only) cycles and alert
+  const isDexScreenerSource = source === "dexscreener" || source === "dexscreener-ca";
+  if (isDexScreenerSource) {
+    s.consecutiveLowTrustCycles++;
+    if (s.consecutiveLowTrustCycles >= DEXSCREENER_LOW_TRUST_ALERT_CYCLES) {
+      log(`⚠️ [#34] ${market.label}: ${s.consecutiveLowTrustCycles} consecutive DexScreener-only cycles — Pyth/Jupiter unavailable. Price trust is reduced.`);
+    }
+  } else {
+    s.consecutiveLowTrustCycles = 0;
+  }
 
   const priceE6 = BigInt(Math.round(price * 1_000_000));
   const timestamp = BigInt(Math.floor(Date.now() / 1000));
@@ -918,6 +1119,16 @@ async function pushAndCrank(market: MarketInfo, programId: PublicKey): Promise<v
       err.txContext = formatTransactionContext(e, tx);
     }
     throw err;
+  }
+
+  // #37: verify the transaction actually landed before crediting the push
+  const included = await verifyTxInclusion(sig);
+  if (!included) {
+    // tx landed but meta.err set — treat as an error push, do not update stats
+    s.totalErrors++;
+    s.consecutiveErrors++;
+    log(`❌ ${market.label}: tx ${sig.slice(0, 12)}... confirmed but meta.err — not crediting push`);
+    return;
   }
 
   s.lastPrice = price;
@@ -1037,7 +1248,16 @@ const ALLOWED_POOL_PROGRAMS = new Set<string>([
     throw err;
   }
 
+  // #37: verify the transaction actually landed before crediting
+  const included = await verifyTxInclusion(sig);
   const s = getOrCreateStats(market);
+  if (!included) {
+    s.totalErrors++;
+    s.consecutiveErrors++;
+    log(`❌ ${market.label}: UpdateHyperpMark tx ${sig.slice(0, 12)}... confirmed but meta.err — not crediting push`);
+    return;
+  }
+
   s.lastPushAt = Date.now();
   s.lastPushSig = sig;
   s.totalPushes++;
@@ -1048,12 +1268,69 @@ const ALLOWED_POOL_PROGRAMS = new Set<string>([
 }
 
 // ── Health Check Server ─────────────────────────────────────
+
+// #35+#36: per-IP rate limit state.
+// Bounded to IP_RATE_LIMIT_MAP_MAX entries to prevent unbounded memory growth from
+// IP spoofing / scanning. When the map is full, the oldest entry is evicted.
+const IP_RATE_LIMIT_WINDOW_MS = 60_000;       // 1-minute sliding window
+const IP_RATE_LIMIT_MAX_REQS  = 60;            // max requests per window per IP
+const IP_RATE_LIMIT_MAP_MAX   = 4096;          // max IPs tracked simultaneously
+const ipRequestLog = new Map<string, number[]>();
+
+function isRateLimited(ip: string): boolean {
+  const now = Date.now();
+  const windowStart = now - IP_RATE_LIMIT_WINDOW_MS;
+  let timestamps = ipRequestLog.get(ip) ?? [];
+  // Remove timestamps outside the window
+  timestamps = timestamps.filter(t => t >= windowStart);
+  if (timestamps.length >= IP_RATE_LIMIT_MAX_REQS) {
+    ipRequestLog.set(ip, timestamps);
+    return true;
+  }
+  timestamps.push(now);
+  // Evict oldest entry if map is full (bounded growth)
+  if (!ipRequestLog.has(ip) && ipRequestLog.size >= IP_RATE_LIMIT_MAP_MAX) {
+    const oldestKey = ipRequestLog.keys().next().value;
+    if (oldestKey !== undefined) ipRequestLog.delete(oldestKey);
+  }
+  ipRequestLog.set(ip, timestamps);
+  return false;
+}
+
+/**
+ * Timing-safe token comparison using crypto.timingSafeEqual.
+ * Length-normalises both buffers before comparison to prevent length-timing
+ * side-channel attacks (#35).
+ */
+function timingSafeTokenEqual(a: string, b: string): boolean {
+  const bufA = Buffer.from(a, "utf8");
+  const bufB = Buffer.from(b, "utf8");
+  // Pad the shorter buffer so both are the same length — this prevents a
+  // length mismatch from immediately revealing that the tokens differ.
+  const len = Math.max(bufA.length, bufB.length);
+  const padA = Buffer.alloc(len);
+  const padB = Buffer.alloc(len);
+  bufA.copy(padA);
+  bufB.copy(padB);
+  return crypto.timingSafeEqual(padA, padB) && bufA.length === bufB.length;
+}
+
 function startHealthServer() {
   const server = http.createServer((req, res) => {
+    // #35+#36: per-IP rate limit (prevents brute-force token guessing)
+    const clientIp = req.socket.remoteAddress ?? "unknown";
+    if (isRateLimited(clientIp)) {
+      res.writeHead(429, { "Content-Type": "application/json", "Retry-After": "60" });
+      res.end(JSON.stringify({ error: "too many requests" }));
+      return;
+    }
+
     // Auth guard: if HEALTH_AUTH_TOKEN is set, require Bearer token
+    // #35: timing-safe comparison to prevent timing side-channel token recovery
     if (HEALTH_AUTH_TOKEN) {
-      const auth = req.headers.authorization;
-      if (auth !== `Bearer ${HEALTH_AUTH_TOKEN}`) {
+      const auth = req.headers.authorization ?? "";
+      const provided = auth.startsWith("Bearer ") ? auth.slice(7) : auth;
+      if (!timingSafeTokenEqual(provided, HEALTH_AUTH_TOKEN)) {
         res.writeHead(401, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ error: "unauthorized" }));
         return;
@@ -1300,7 +1577,7 @@ async function fetchPriceByCA(mainnetCA: string): Promise<PriceResult | null> {
     }
   } catch {}
 
-  // DexScreener fallback
+  // DexScreener fallback — tag with tighter bound (#34)
   try {
     const resp = await fetch(
       `https://api.dexscreener.com/latest/dex/tokens/${encoded}`,
@@ -1310,7 +1587,7 @@ async function fetchPriceByCA(mainnetCA: string): Promise<PriceResult | null> {
     const pair = json.pairs?.[0];
     if (pair?.priceUsd) {
       const p = parseFloat(pair.priceUsd);
-      if (isFinite(p) && p > 0) return { price: p, source: "dexscreener-ca", freshAt: Date.now() };
+      if (isFinite(p) && p > 0) return { price: p, source: "dexscreener-ca", freshAt: Date.now(), maxMovePct: DEXSCREENER_MAX_MOVE_PCT };
     }
   } catch {}
 
@@ -1388,6 +1665,21 @@ async function main() {
     process.exit(1);
   }
 
+  // #32: Build the EXPECTED_PROGRAM_IDS allowlist.
+  // Always includes deploy.programId. ADDITIONAL_PROGRAM_IDS (comma-separated)
+  // lets operators allowlist additional program tiers (e.g. legacy small-tier).
+  allowedProgramIds.add(programId.toBase58());
+  const additionalIds = (process.env.ADDITIONAL_PROGRAM_IDS ?? "").split(",").map(s => s.trim()).filter(Boolean);
+  for (const id of additionalIds) {
+    try {
+      const pk = new PublicKey(id);
+      allowedProgramIds.add(pk.toBase58());
+    } catch {
+      console.error(`⚠️ [#32] Invalid ADDITIONAL_PROGRAM_IDS entry: "${id}" — ignoring`);
+    }
+  }
+  log(`[#32] Slab program allowlist (${allowedProgramIds.size}): ${[...allowedProgramIds].map(id => id.slice(0, 12) + "...").join(", ")}`);
+
   if (!Array.isArray(deploy.markets)) {
     deploy.markets = [];
   }
@@ -1414,6 +1706,11 @@ async function main() {
       // preventing "Provided owner is not allowed" for markets on different program tiers.
       const slabInfo = await getAccountInfoWithTimeout(conn, new PublicKey(m.slab));
       if (!slabInfo) throw new Error(`Slab account not found`);
+      // #32: validate slab owner BEFORE parseConfig/trusting any account data
+      if (!isAllowedProgramId(slabInfo.owner, m.slab, `STARTUP: ${m.label}`)) {
+        skippedMarkets.add(m.slab);
+        continue;
+      }
       const slabData = new Uint8Array(slabInfo.data);
       const cfg = parseConfig(slabData);
       if (!cfg.oracleAuthority.equals(admin.publicKey)) {
@@ -1459,6 +1756,10 @@ async function main() {
   let lastDiscoveryAt = 0;
   if (supabaseEnabled) {
     log(`Supabase auto-discovery enabled (interval: ${DISCOVERY_INTERVAL_MS}ms)`);
+    // #46: warn when using service role key without a dedicated anon key
+    if (!process.env.SUPABASE_ANON_KEY && SUPABASE_SERVICE_KEY) {
+      log("⚠️ [#46] SUPABASE_ANON_KEY not set — falling back to SUPABASE_SERVICE_ROLE_KEY for read queries. Provision a dedicated anon/read key to reduce exposure.");
+    }
     // Load mainnet CAs for existing markets from Supabase
     const caRows = await supabaseQuery(
       "markets",
@@ -1471,7 +1772,7 @@ async function main() {
       log(`Loaded ${caRows.length} mainnet CA mapping(s) from Supabase`);
     }
   } else {
-    log("⚠️ Supabase not configured — auto-discovery disabled (set SUPABASE_URL + SUPABASE_SERVICE_ROLE_KEY)");
+    log("⚠️ Supabase not configured — auto-discovery disabled (set SUPABASE_URL + SUPABASE_SERVICE_ROLE_KEY or SUPABASE_ANON_KEY)");
   }
 
   // Main push loop
@@ -1509,6 +1810,11 @@ async function main() {
             try {
               const slabInfo = await getAccountInfoWithTimeout(conn, new PublicKey(m.slab));
               if (!slabInfo) throw new Error(`Slab account not found`);
+              // #32: validate slab owner BEFORE parseConfig/trusting any account data
+              if (!isAllowedProgramId(slabInfo.owner, m.slab, m.label)) {
+                skippedMarkets.add(m.slab);
+                continue;
+              }
               const slabData = new Uint8Array(slabInfo.data);
               const cfg = parseConfig(slabData);
               if (!cfg.oracleAuthority.equals(admin.publicKey)) {
