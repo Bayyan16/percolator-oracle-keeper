@@ -341,6 +341,7 @@ interface MarketStats {
   symbol: string;
   lastPrice: number;
   lastPushAt: number;       // epoch ms
+  lastFreshPriceAt: number;  // epoch ms of last successful live-source push
   lastPushSig: string;
   totalPushes: number;
   totalErrors: number;
@@ -538,6 +539,7 @@ function getOrCreateStats(market: MarketInfo): MarketStats {
       symbol: market.symbol,
       lastPrice: 0,
       lastPushAt: 0,
+      lastFreshPriceAt: 0,
       lastPushSig: "",
       totalPushes: 0,
       totalErrors: 0,
@@ -711,10 +713,10 @@ async function pushAndCrank(market: MarketInfo, programId: PublicKey): Promise<v
     price = result.price;
     source = result.source;
   } else if (s.lastPrice > 0) {
-    // Devnet / no-pool fallback: use last successfully pushed price to keep oracle alive.
-    // Logged clearly so ops know the market is running on cached data.
-    const lastKnownAgeSec = s.lastPushAt
-      ? Math.floor((Date.now() - s.lastPushAt) / 1000)
+    // Devnet / transient no-pool fallback: reuse the last successfully pushed
+    // live-source price only while it remains within the freshness threshold.
+    const lastKnownAgeSec = s.lastFreshPriceAt
+      ? Math.floor((Date.now() - s.lastFreshPriceAt) / 1000)
       : Infinity;
 
     if (lastKnownAgeSec > STALE_THRESHOLD_S) {
@@ -789,6 +791,9 @@ async function pushAndCrank(market: MarketInfo, programId: PublicKey): Promise<v
 
   s.lastPrice = price;
   s.lastPushAt = Date.now();
+  if (source !== "last-known") {
+    s.lastFreshPriceAt = s.lastPushAt;
+  }
   s.lastPushSig = sig;
   s.totalPushes++;
   s.consecutiveErrors = 0;
