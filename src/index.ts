@@ -44,10 +44,21 @@ import * as fs from "fs";
 import * as http from "http";
 
 // ── Config ──────────────────────────────────────────────────
-const PUSH_INTERVAL_MS = Number(process.env.PUSH_INTERVAL_MS ?? "3000");
-const HEALTH_PORT = Number(process.env.HEALTH_PORT ?? "18810");
-const MAX_PRICE_MOVE_PCT = Number(process.env.MAX_PRICE_MOVE_PCT ?? "10");
-const STALE_THRESHOLD_S = Number(process.env.STALE_THRESHOLD_S ?? "30");
+function parsePositiveNumberEnv(name: string, fallback: number): number {
+  const raw = process.env[name];
+  const value = raw == null || raw.trim() === "" ? fallback : Number(raw);
+
+  if (!Number.isFinite(value) || value <= 0) {
+    throw new Error(`${name} must be a finite positive number`);
+  }
+
+  return value;
+}
+
+const PUSH_INTERVAL_MS = parsePositiveNumberEnv("PUSH_INTERVAL_MS", 3000);
+const HEALTH_PORT = parsePositiveNumberEnv("HEALTH_PORT", 18810);
+const MAX_PRICE_MOVE_PCT = parsePositiveNumberEnv("MAX_PRICE_MOVE_PCT", 10);
+const STALE_THRESHOLD_S = parsePositiveNumberEnv("STALE_THRESHOLD_S", 30);
 /**
  * Blocked Markets - Markets that cannot be serviced by this oracle-keeper
  *
