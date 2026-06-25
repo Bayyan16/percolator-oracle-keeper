@@ -898,36 +898,71 @@ function log(msg: string) {
   console.log(`[${ts}] [oracle-keeper] ${msg}`);
 }
 
+const VERIFY_TX_RETRIES = Math.max(
+  1,
+  Math.floor(parsePositiveNumberEnv("VERIFY_TX_RETRIES", 3)),
+);
+
+const VERIFY_TX_RETRY_DELAY_MS = parsePositiveNumberEnv(
+  "VERIFY_TX_RETRY_DELAY_MS",
+  1000,
+);
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 /**
  * #37: Verify a transaction signature was actually included on-chain.
  *
  * Uses connVerify (if set) or falls back to conn. If the verify RPC itself
  * errors we credit the push optimistically (don't halt on RPC outage).
- * Returns true if confirmed or if the verify check errored (optimistic credit).
- * Returns false only when we can positively confirm the tx was NOT included.
+ *
+ * Returns true when the transaction is found and has no meta.err.
+ * Returns false when the transaction landed with meta.err, or when it is still
+ * not found after a small retry window.
  */
 async function verifyTxInclusion(sig: string): Promise<boolean> {
   const verifyConn = connVerify ?? conn;
+
   try {
-    const result = await verifyConn.getTransaction(sig, {
-      commitment: "confirmed",
-      maxSupportedTransactionVersion: 0,
-    });
-    if (result === null) {
-      // Transaction not found — may still be pending; treat as not confirmed
-      log(`⚠️ [#37] tx ${sig.slice(0, 12)}... not found on verify RPC after sendAndConfirm — optimistic credit`);
-      // Optimistic: sendAndConfirmTransaction already waited for confirmation;
-      // a missing tx on the verify RPC is likely a propagation lag, not a real miss.
+    for (let attempt = 1; attempt <= VERIFY_TX_RETRIES; attempt++) {
+      const result = await verifyConn.getTransaction(sig, {
+        commitment: "confirmed",
+        maxSupportedTransactionVersion: 0,
+      });
+
+      if (result === null) {
+        if (attempt < VERIFY_TX_RETRIES) {
+          log(
+            `⚠️ [#37] tx ${sig.slice(0, 12)}... not found on verify RPC after sendAndConfirm — retrying (${attempt}/${VERIFY_TX_RETRIES})`,
+          );
+          await sleep(VERIFY_TX_RETRY_DELAY_MS);
+          continue;
+        }
+
+        log(
+          `⚠️ [#37] tx ${sig.slice(0, 12)}... not found on verify RPC after ${VERIFY_TX_RETRIES} attempt(s) — not crediting push`,
+        );
+        return false;
+      }
+
+      if (result.meta?.err) {
+        log(
+          `⚠️ [#37] tx ${sig.slice(0, 12)}... landed but meta.err=${JSON.stringify(result.meta.err)} — marking as error`,
+        );
+        return false;
+      }
+
       return true;
     }
-    if (result.meta?.err) {
-      log(`⚠️ [#37] tx ${sig.slice(0, 12)}... landed but meta.err=${JSON.stringify(result.meta.err)} — marking as error`);
-      return false;
-    }
-    return true;
+
+    return false;
   } catch (e) {
     // Verify RPC errored — credit optimistically, don't halt on verify-RPC outage
-    log(`⚠️ [#37] verify RPC error for tx ${sig.slice(0, 12)}...: ${(e as Error).message?.slice(0, 60)} — crediting optimistically`);
+    log(
+      `⚠️ [#37] verify RPC error for tx ${sig.slice(0, 12)}...: ${(e as Error).message?.slice(0, 60)} — crediting optimistically`,
+    );
     return true;
   }
 }
