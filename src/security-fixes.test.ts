@@ -354,3 +354,138 @@ describe("#34 DexScreener tighter circuit-breaker bound", () => {
     assert.equal(counter, 0, "jupiter-ca should reset the low-trust counter");
   });
 });
+
+
+// ══════════════════════════════════════════════════════════════
+// #63 — disabled oracle_markets HYPERP override restores identity
+// ══════════════════════════════════════════════════════════════
+//
+// index.ts has runtime side effects, so this test mirrors the pure state
+// transition added by #63.
+
+describe("#63 oracle_markets HYPERP disable restores pricing identity", () => {
+  type Market = {
+    symbol: string;
+    label: string;
+    slab: string;
+    oracleMode?: string;
+    dexPoolAddress?: string;
+    isDynamic?: boolean;
+  };
+
+  function cloneMarket(market: Market): Market {
+    return { ...market };
+  }
+
+  function rememberPreHyperpMarketState(
+    snapshots: Map<string, Market | null>,
+    slab: string,
+    market: Market | null,
+  ) {
+    if (!snapshots.has(slab)) {
+      snapshots.set(slab, market ? cloneMarket(market) : null);
+    }
+  }
+
+  function disableHyperpOverrideLikeKeeper(
+    markets: Market[],
+    knownSlabs: Set<string>,
+    stats: Map<string, { symbol: string }>,
+    slabToMainnetCA: Map<string, string>,
+    snapshots: Map<string, Market | null>,
+    slab: string,
+  ) {
+    const existingIdx = markets.findIndex(m => m.slab === slab);
+    const original = snapshots.get(slab);
+
+    if (existingIdx >= 0 && original) {
+      markets[existingIdx] = cloneMarket(original);
+      const existingStats = stats.get(slab);
+      if (existingStats) {
+        existingStats.symbol = original.symbol;
+      }
+      if (original.isDynamic !== true) {
+        slabToMainnetCA.delete(slab);
+      }
+      snapshots.delete(slab);
+      return;
+    }
+
+    if (existingIdx >= 0) {
+      markets.splice(existingIdx, 1);
+    }
+
+    knownSlabs.delete(slab);
+    stats.delete(slab);
+    snapshots.delete(slab);
+  }
+
+  it("restores the pre-HYPERP identity for an existing market", () => {
+    const slab = "slab_existing_111111111111111111111111111111";
+    const pool = "Pool111111111111111111111111111111111111111";
+
+    const markets: Market[] = [
+      {
+        symbol: "SOL",
+        label: "SOL-PERP",
+        slab,
+        oracleMode: "admin",
+        isDynamic: false,
+      },
+    ];
+    const knownSlabs = new Set([slab]);
+    const stats = new Map([[slab, { symbol: "SOL" }]]);
+    const staleMainnetCA = "StaleCA111111111111111111111111111111111111";
+    const slabToMainnetCA = new Map([[slab, staleMainnetCA]]);
+    const snapshots = new Map<string, Market | null>();
+
+    rememberPreHyperpMarketState(snapshots, slab, markets[0]);
+
+    markets[0].symbol = "HYPERP";
+    markets[0].label = "HYPERP-PERP";
+    markets[0].oracleMode = "hyperp";
+    markets[0].dexPoolAddress = pool;
+    markets[0].isDynamic = true;
+    stats.get(slab)!.symbol = "HYPERP";
+
+    disableHyperpOverrideLikeKeeper(markets, knownSlabs, stats, slabToMainnetCA, snapshots, slab);
+
+    assert.equal(markets.length, 1);
+    assert.equal(markets[0].symbol, "SOL");
+    assert.equal(markets[0].label, "SOL-PERP");
+    assert.equal(markets[0].oracleMode, "admin");
+    assert.equal(markets[0].dexPoolAddress, undefined);
+    assert.equal(markets[0].isDynamic, false);
+    assert.equal(stats.get(slab)?.symbol, "SOL");
+    assert.equal(knownSlabs.has(slab), true);
+    assert.equal(slabToMainnetCA.has(slab), false);
+  });
+
+  it("removes oracle_markets-only HYPERP markets when the override is disabled", () => {
+    const slab = "slab_oracle_only_111111111111111111111111111";
+    const markets: Market[] = [
+      {
+        symbol: "HYPERP",
+        label: "slab_ora... (oracle_markets)",
+        slab,
+        oracleMode: "hyperp",
+        dexPoolAddress: "Pool111111111111111111111111111111111111111",
+        isDynamic: true,
+      },
+    ];
+    const knownSlabs = new Set([slab]);
+    const stats = new Map([[slab, { symbol: "HYPERP" }]]);
+    const currentMainnetCA = "CurrentCA11111111111111111111111111111111111";
+    const slabToMainnetCA = new Map([[slab, currentMainnetCA]]);
+    const snapshots = new Map<string, Market | null>();
+
+    rememberPreHyperpMarketState(snapshots, slab, null);
+    disableHyperpOverrideLikeKeeper(markets, knownSlabs, stats, slabToMainnetCA, snapshots, slab);
+
+    assert.equal(markets.length, 0);
+    assert.equal(knownSlabs.has(slab), false);
+    assert.equal(stats.has(slab), false);
+    assert.equal(snapshots.has(slab), false);
+    assert.equal(slabToMainnetCA.get(slab), currentMainnetCA);
+  });
+});

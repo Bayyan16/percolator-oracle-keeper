@@ -1521,6 +1521,66 @@ let markets: MarketInfo[] = [];
 // detect when they're disabled and downgrade them back to admin oracle mode.
 const hyperpFromOracleTable = new Set<string>();
 
+// #63: remember the market identity before an oracle_markets HYPERP override.
+// When the override is disabled, restore the previous identity or remove
+// oracle_markets-only HYPERP entries instead of leaving stale dynamic state.
+const hyperpOriginalMarketState = new Map<string, MarketInfo | null>();
+
+function cloneMarketInfo(market: MarketInfo): MarketInfo {
+  return { ...market };
+}
+
+function rememberPreHyperpMarketState(slab: string, market: MarketInfo | null): void {
+  if (!hyperpOriginalMarketState.has(slab)) {
+    hyperpOriginalMarketState.set(slab, market ? cloneMarketInfo(market) : null);
+  }
+}
+
+function cleanupRemovedMarketRuntimeState(slab: string): void {
+  knownSlabs.delete(slab);
+  stats.delete(slab);
+  skippedMarkets.delete(slab);
+  authorityVerified.delete(slab);
+  slabProgramId.delete(slab);
+  slabOracleMode.delete(slab);
+  hyperpPoolCache.delete(slab);
+}
+
+function disableHyperpOverride(slab: string): void {
+  const existingIdx = markets.findIndex(m => m.slab === slab);
+  const original = hyperpOriginalMarketState.get(slab);
+
+  if (existingIdx >= 0 && original) {
+    const previousLabel = markets[existingIdx].label;
+    markets[existingIdx] = cloneMarketInfo(original);
+
+    const existingStats = stats.get(slab);
+    if (existingStats) {
+      existingStats.symbol = original.symbol;
+    }
+
+    hyperpPoolCache.delete(slab);
+    if (original.isDynamic !== true) {
+      slabToMainnetCA.delete(slab);
+    }
+    hyperpOriginalMarketState.delete(slab);
+
+    log(`⬇️ ${previousLabel}: oracle_markets disabled → restored ${original.label} (${original.oracleMode ?? "admin"} oracle mode)`);
+    return;
+  }
+
+  if (existingIdx >= 0) {
+    const removed = markets[existingIdx];
+    markets.splice(existingIdx, 1);
+    cleanupRemovedMarketRuntimeState(slab);
+    log(`🧹 ${removed.label}: oracle_markets disabled → removed oracle_markets-only HYPERP market`);
+  } else {
+    cleanupRemovedMarketRuntimeState(slab);
+  }
+
+  hyperpOriginalMarketState.delete(slab);
+}
+
 /**
  * Discovers HYPERP markets from the Supabase oracle_markets table.
  *
@@ -1549,16 +1609,13 @@ async function discoverHyperpFromOracleTable(): Promise<MarketInfo[]> {
       data.filter((r: any) => r.enabled && r.slab_address && r.dex_pool_address).map((r: any) => r.slab_address as string)
     );
 
-    // Downgrade: previously-registered hyperp slabs that are now disabled
+    // Downgrade: previously-registered HYPERP slabs that are now disabled.
+    // #63: restore/remove the full pricing identity instead of only changing
+    // oracleMode. Otherwise an admin market can remain symbol="HYPERP" and
+    // isDynamic=true, keeping getPrice() in the dynamic CA-only path.
     for (const slab of hyperpFromOracleTable) {
       if (!enabledHyperpSlabs.has(slab)) {
-        const existing = markets.find(m => m.slab === slab);
-        if (existing && existing.oracleMode === "hyperp") {
-          log(`⬇️ ${existing.label}: oracle_markets disabled → downgrading from hyperp to admin oracle mode`);
-          existing.oracleMode = "admin";
-          existing.dexPoolAddress = undefined;
-          hyperpPoolCache.delete(slab);
-        }
+        disableHyperpOverride(slab);
         hyperpFromOracleTable.delete(slab);
       }
     }
@@ -1572,6 +1629,8 @@ async function discoverHyperpFromOracleTable(): Promise<MarketInfo[]> {
         // the pool override when oracle_markets changes dex_pool_address.
         const existing = markets.find(m => m.slab === row.slab_address);
         if (existing) {
+          rememberPreHyperpMarketState(row.slab_address, existing);
+
           if (existing.oracleMode !== "hyperp") {
             log(`🔄 ${existing.label}: oracle_markets override → hyperp (pool=${row.dex_pool_address.slice(0, 12)}...)`);
             existing.oracleMode = "hyperp";
@@ -1589,6 +1648,7 @@ async function discoverHyperpFromOracleTable(): Promise<MarketInfo[]> {
 
       knownSlabs.add(row.slab_address);
       hyperpFromOracleTable.add(row.slab_address);
+      rememberPreHyperpMarketState(row.slab_address, null);
       newMarkets.push({
         symbol: "HYPERP",
         label: `${row.slab_address.slice(0, 8)}... (oracle_markets)`,
