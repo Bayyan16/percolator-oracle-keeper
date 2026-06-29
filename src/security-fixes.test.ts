@@ -14,6 +14,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { parsePositiveNumberEnv } from "./env-utils.ts";
+import { isPythConfidenceAcceptable, parsePythPriceQuality } from "./pyth-confidence.ts";
 import { checkCircuitBreaker } from "./circuit-breaker.ts";
 import type { CircuitBreakerState } from "./circuit-breaker.ts";
 
@@ -352,5 +353,87 @@ describe("#34 DexScreener tighter circuit-breaker bound", () => {
       }
     });
     assert.equal(counter, 0, "jupiter-ca should reset the low-trust counter");
+  });
+});
+
+
+// ══════════════════════════════════════════════════════════════
+// #67 — Pyth confidence interval validation
+// ══════════════════════════════════════════════════════════════
+describe("#67 Pyth confidence interval validation", () => {
+  it("rejects a fresh positive Pyth price when conf/price is too wide", () => {
+    const pythPrice = {
+      price: "15000000",
+      conf: "15000000",
+      expo: -5,
+    };
+
+    const parsed = parsePythPriceQuality(pythPrice);
+
+    assert.equal(parsed?.price, 150);
+    assert.equal(parsed?.confidencePct, 100);
+    assert.equal(
+      isPythConfidenceAcceptable(pythPrice, 10),
+      false,
+      "100% confidence interval must be rejected when threshold is 10%",
+    );
+  });
+
+  it("accepts a Pyth price when confidence is within threshold", () => {
+    const pythPrice = {
+      price: "15000000",
+      conf: "150000",
+      expo: -5,
+    };
+
+    const parsed = parsePythPriceQuality(pythPrice);
+
+    assert.equal(parsed?.price, 150);
+    assert.equal(parsed?.confidencePct, 1);
+    assert.equal(isPythConfidenceAcceptable(pythPrice, 10), true);
+  });
+
+  it("accepts confidence exactly at the threshold", () => {
+    const pythPrice = {
+      price: "1000000",
+      conf: "100000",
+      expo: -4,
+    };
+
+    assert.equal(isPythConfidenceAcceptable(pythPrice, 10), true);
+  });
+
+  it("rejects missing confidence", () => {
+    const pythPrice = {
+      price: "15000000",
+      expo: -5,
+    };
+
+    assert.equal(parsePythPriceQuality(pythPrice), null);
+    assert.equal(isPythConfidenceAcceptable(pythPrice, 10), false);
+  });
+
+  it("rejects invalid, negative, or non-finite confidence values", () => {
+    assert.equal(
+      parsePythPriceQuality({ price: "15000000", conf: "not-a-number", expo: -5 }),
+      null,
+    );
+
+    assert.equal(
+      parsePythPriceQuality({ price: "15000000", conf: "-1", expo: -5 }),
+      null,
+    );
+  });
+
+  it("rejects zero or invalid price values", () => {
+    assert.equal(
+      parsePythPriceQuality({ price: "0", conf: "1", expo: -5 }),
+      null,
+    );
+
+    assert.equal(
+      parsePythPriceQuality({ price: "not-a-number", conf: "1", expo: -5 }),
+      null,
+    );
   });
 });

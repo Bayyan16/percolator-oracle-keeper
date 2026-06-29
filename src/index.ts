@@ -50,6 +50,7 @@ import * as crypto from "crypto";
 
 // ── Config ──────────────────────────────────────────────────
 import { parsePositiveNumberEnv, requireProgramIdForSupabaseMode } from "./env-utils.ts";
+import { parsePythPriceQuality } from "./pyth-confidence.ts";
 import { checkCircuitBreaker as _checkCircuitBreaker } from "./circuit-breaker.ts";
 import type { CircuitBreakerState } from "./circuit-breaker.ts";
 
@@ -65,6 +66,7 @@ if (process.env.NODE_TLS_REJECT_UNAUTHORIZED === "0") {
 const PUSH_INTERVAL_MS    = parsePositiveNumberEnv("PUSH_INTERVAL_MS",    3000);
 const HEALTH_PORT         = parsePositiveNumberEnv("HEALTH_PORT",         18810);
 const MAX_PRICE_MOVE_PCT  = parsePositiveNumberEnv("MAX_PRICE_MOVE_PCT",  10, 100);
+const PYTH_MAX_CONFIDENCE_PCT = parsePositiveNumberEnv("PYTH_MAX_CONFIDENCE_PCT", 10, 100);
 const STALE_THRESHOLD_S   = parsePositiveNumberEnv("STALE_THRESHOLD_S",   30);
 /**
  * Number of consecutive circuit-breaker trips at a consistent new price level
@@ -687,7 +689,7 @@ async function fetchPythPrices(symbols: string[]): Promise<void> {
       binary?: { encoding?: string; data?: string[] };
       parsed: Array<{
         id: string;
-        price: { price: string; expo: number; publish_time: number };
+        price: { price: string; conf?: string; expo: number; publish_time: number };
       }>;
     };
 
@@ -709,20 +711,36 @@ async function fetchPythPrices(symbols: string[]): Promise<void> {
     for (const entry of json.parsed) {
       const sym = idToSymbol.get(entry.id);
       if (!sym) continue;
-      const rawPrice = parseInt(entry.price.price, 10);
-      const expo = entry.price.expo;
-      const price = rawPrice * Math.pow(10, expo);
+      const parsedPrice = parsePythPriceQuality(entry.price);
+
+    if (!parsedPrice) {
+      log(`⚠️ ${sym}: Pyth price/conf invalid or missing — rejecting price`);
+      continue;
+    }
+
+    const { price, confidencePct } = parsedPrice;
       // Use Pyth's publish_time as the cache timestamp (not fetch time).
       // This ensures getPythPrice's 30s staleness check operates against the
       // actual Pyth oracle clock, not the moment we fetched the HTTP response.
       // Reject prices Pyth hasn't updated in 60s — they are stale at the source.
       const publishMs = entry.price.publish_time * 1000;
       const ageMs = Date.now() - publishMs;
-      if (price > 0 && ageMs >= 0 && ageMs < 60_000) {
-        pythCache.set(sym, { price, ts: publishMs });
-      } else if (price > 0) {
-        log(`⚠️ ${sym}: Pyth publish_time is ${Math.floor(ageMs / 1000)}s old — rejecting stale price`);
-      }
+      if (!Number.isFinite(publishMs) || !Number.isFinite(ageMs)) {
+      log(`⚠️ ${sym}: Pyth publish_time invalid — rejecting price`);
+      continue;
+    }
+
+    if (confidencePct > PYTH_MAX_CONFIDENCE_PCT) {
+      log(`⚠️ ${sym}: Pyth confidence too wide (${confidencePct.toFixed(2)}% > ${PYTH_MAX_CONFIDENCE_PCT}%) — rejecting price`);
+      continue;
+    }
+
+    if (ageMs < 0 || ageMs >= 60_000) {
+      log(`⚠️ ${sym}: Pyth publish_time is ${Math.floor(ageMs / 1000)}s old — rejecting stale price`);
+      continue;
+    }
+
+    pythCache.set(sym, { price, ts: publishMs });
     }
   } catch (e) {
     log(`⚠️ Pyth Hermes fetch failed: ${(e as Error).message?.slice(0, 60)}`);
