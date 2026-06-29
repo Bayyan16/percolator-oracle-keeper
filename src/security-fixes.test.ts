@@ -423,6 +423,11 @@ describe("#67 Pyth confidence interval validation", () => {
       parsePythPriceQuality({ price: "15000000", conf: "-1", expo: -5 }),
       null,
     );
+
+    assert.equal(
+      parsePythPriceQuality({ price: "15000000", conf: "Infinity", expo: -5 }),
+      null,
+    );
   });
 
   it("rejects zero or invalid price values", () => {
@@ -433,6 +438,13 @@ describe("#67 Pyth confidence interval validation", () => {
 
     assert.equal(
       parsePythPriceQuality({ price: "not-a-number", conf: "1", expo: -5 }),
+      null,
+    );
+  });
+
+  it("rejects exponent underflow that would collapse price to zero", () => {
+    assert.equal(
+      parsePythPriceQuality({ price: "1", conf: "0", expo: -10000 }),
       null,
     );
   });

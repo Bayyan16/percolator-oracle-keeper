@@ -24,6 +24,11 @@ export function parsePythPriceQuality(payload: PythPricePayload): PythPriceQuali
   }
 
   const scale = Math.pow(10, expo);
+
+  if (!Number.isFinite(scale) || scale === 0) {
+    return null;
+  }
+
   const price = rawPrice * scale;
   const conf = rawConf * scale;
 
@@ -31,7 +36,13 @@ export function parsePythPriceQuality(payload: PythPricePayload): PythPriceQuali
   // gives the same percentage ratio without precision loss from scaling.
   const confidencePct = Math.abs(rawConf / rawPrice) * 100;
 
-  if (!Number.isFinite(price) || !Number.isFinite(conf) || !Number.isFinite(confidencePct)) {
+  if (
+    !Number.isFinite(price) ||
+    !Number.isFinite(conf) ||
+    !Number.isFinite(confidencePct) ||
+    price <= 0 ||
+    conf < 0
+  ) {
     return null;
   }
 
