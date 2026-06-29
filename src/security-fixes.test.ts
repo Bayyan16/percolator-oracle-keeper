@@ -14,6 +14,10 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { parsePositiveNumberEnv } from "./env-utils.ts";
+import {
+  getDynamicFirstPushSecondarySource,
+  isFirstPushSecondaryWithinTolerance,
+} from "./dynamic-first-push.ts";
 import { checkCircuitBreaker } from "./circuit-breaker.ts";
 import type { CircuitBreakerState } from "./circuit-breaker.ts";
 
@@ -352,5 +356,77 @@ describe("#34 DexScreener tighter circuit-breaker bound", () => {
       }
     });
     assert.equal(counter, 0, "jupiter-ca should reset the low-trust counter");
+  });
+});
+
+
+// ══════════════════════════════════════════════════════════════
+// #55 — Dynamic CA first-push cross-check routing
+// ══════════════════════════════════════════════════════════════
+describe("#55 dynamic CA first-push cross-check", () => {
+  it("routes a jupiter-ca first push to a dexscreener-ca secondary", () => {
+    assert.equal(getDynamicFirstPushSecondarySource("jupiter-ca"), "dexscreener-ca");
+  });
+
+  it("routes a dexscreener-ca first push to a jupiter-ca secondary", () => {
+    assert.equal(getDynamicFirstPushSecondarySource("dexscreener-ca"), "jupiter-ca");
+  });
+
+  it("does not use symbol-based sources as dynamic CA secondary confirmation", () => {
+    assert.equal(getDynamicFirstPushSecondarySource("jupiter"), null);
+    assert.equal(getDynamicFirstPushSecondarySource("dexscreener"), null);
+    assert.equal(getDynamicFirstPushSecondarySource("pyth"), null);
+    assert.equal(getDynamicFirstPushSecondarySource("unknown"), null);
+  });
+
+  it("accepts a CA first push when the independent CA secondary is within tolerance", () => {
+    assert.equal(isFirstPushSecondaryWithinTolerance(100, 100.5, 5), true);
+  });
+
+  it("accepts a CA first push exactly at the tolerance boundary", () => {
+    assert.equal(isFirstPushSecondaryWithinTolerance(100, 105, 5), true);
+  });
+
+  it("rejects a CA first push when no independent CA secondary is available", () => {
+    assert.equal(isFirstPushSecondaryWithinTolerance(100, null, 5), false);
+  });
+
+  it("rejects a CA first push when the independent CA secondary diverges beyond tolerance", () => {
+    assert.equal(isFirstPushSecondaryWithinTolerance(100, 120, 5), false);
+  });
+
+  it("rejects invalid first-push comparison inputs", () => {
+    assert.equal(isFirstPushSecondaryWithinTolerance(0, 100, 5), false);
+    assert.equal(isFirstPushSecondaryWithinTolerance(100, 0, 5), false);
+    assert.equal(isFirstPushSecondaryWithinTolerance(Number.NaN, 100, 5), false);
+    assert.equal(isFirstPushSecondaryWithinTolerance(100, Number.NaN, 5), false);
+    assert.equal(isFirstPushSecondaryWithinTolerance(100, 100, -1), false);
+  });
+
+  it("mirrors issue #55: unknown dynamic symbol can bootstrap using CA-based confirmation", () => {
+    const displaySymbol = "NEWTOKEN";
+    const primarySource = "jupiter-ca";
+    const primaryPrice = 1.23;
+
+    const staticSymbolJupiter = new Map<string, number>();
+    const staticSymbolPyth = new Map<string, number>();
+    const caSecondaryPrices = new Map<string, number>([
+      ["dexscreener-ca", 1.231],
+    ]);
+
+    const symbolBasedSecondary =
+      staticSymbolJupiter.get(displaySymbol) ?? staticSymbolPyth.get(displaySymbol) ?? null;
+
+    assert.equal(symbolBasedSecondary, null, "display symbol is intentionally unknown");
+
+    const secondarySource = getDynamicFirstPushSecondarySource(primarySource);
+    const caSecondary = secondarySource ? caSecondaryPrices.get(secondarySource) ?? null : null;
+
+    assert.equal(secondarySource, "dexscreener-ca");
+    assert.equal(
+      isFirstPushSecondaryWithinTolerance(primaryPrice, caSecondary, 5),
+      true,
+      "dynamic markets should confirm first push through CA-based secondary pricing, not symbol maps",
+    );
   });
 });

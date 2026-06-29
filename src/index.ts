@@ -50,6 +50,10 @@ import * as crypto from "crypto";
 
 // ── Config ──────────────────────────────────────────────────
 import { parsePositiveNumberEnv, requireProgramIdForSupabaseMode } from "./env-utils.ts";
+import {
+  getDynamicFirstPushSecondarySource,
+  isFirstPushSecondaryWithinTolerance,
+} from "./dynamic-first-push.ts";
 import { checkCircuitBreaker as _checkCircuitBreaker } from "./circuit-breaker.ts";
 import type { CircuitBreakerState } from "./circuit-breaker.ts";
 
@@ -1150,42 +1154,64 @@ async function pushAndCrank(market: MarketInfo, programId: PublicKey): Promise<v
   //
   // The actual circuit-breaker (sync) runs after this async pre-check.
   if (s.lastPrice === 0 && source !== "pyth") {
-    // Attempt a secondary source confirmation
+    // Attempt a secondary source confirmation.
     let secondaryOk = false;
     let secondaryPrice: number | null = null;
-    // Try Jupiter first (it's the fastest non-Pyth source)
-    const jupPrice = await fetchJupiterPrice(market.symbol);
-    if (jupPrice !== null) {
-      secondaryPrice = jupPrice;
-      const movePct = Math.abs((price - jupPrice) / jupPrice) * 100;
-      // Use DEXSCREENER_MAX_MOVE_PCT as the cross-check tolerance
-      if (movePct <= DEXSCREENER_MAX_MOVE_PCT) {
-        secondaryOk = true;
+
+    if (market.isDynamic) {
+      // #55: Dynamic markets are identified by mainnet_ca, not display symbol.
+      // Confirm CA-priced first pushes using an independent CA-based source.
+      const ca = market.slab ? slabToMainnetCA.get(market.slab) : null;
+
+      if (ca) {
+        secondaryPrice = await fetchDynamicFirstPushSecondaryPrice(ca, source);
+        secondaryOk = isFirstPushSecondaryWithinTolerance(
+          price,
+          secondaryPrice,
+          DEXSCREENER_MAX_MOVE_PCT,
+        );
       }
-    }
-    if (!secondaryOk) {
-      // Also try Pyth cache (may have been populated by this tick's batch fetch)
-      const pythEntry = getPythPrice(market.symbol);
-      if (pythEntry) {
-        const movePct = Math.abs((price - pythEntry.price) / pythEntry.price) * 100;
-        if (movePct <= DEXSCREENER_MAX_MOVE_PCT) {
-          secondaryOk = true;
+    } else {
+      // Static markets keep the existing symbol-based confirmation path.
+      const jupPrice = await fetchJupiterPrice(market.symbol);
+
+      if (jupPrice !== null) {
+        secondaryPrice = jupPrice;
+        secondaryOk = isFirstPushSecondaryWithinTolerance(
+          price,
+          jupPrice,
+          DEXSCREENER_MAX_MOVE_PCT,
+        );
+      }
+
+      if (!secondaryOk) {
+        const pythEntry = getPythPrice(market.symbol);
+
+        if (pythEntry) {
           secondaryPrice = pythEntry.price;
+          secondaryOk = isFirstPushSecondaryWithinTolerance(
+            price,
+            pythEntry.price,
+            DEXSCREENER_MAX_MOVE_PCT,
+          );
         }
       }
     }
+
     if (!secondaryOk) {
       log(
-        `⚠️ [#33] ${market.label}: first push cross-check FAILED — ` +
-        `${source} price $${price.toFixed(4)} not confirmed by secondary source ` +
-        `(secondary=${ secondaryPrice !== null ? `$${secondaryPrice.toFixed(4)}` : "unavailable" }). ` +
-        `Holding until cross-check passes or a Pyth price becomes available.`,
+        `⚠️ [#33/#55] ${market.label}: first push cross-check FAILED → ` +
+          `source=${source} price=$${price.toFixed(4)} not confirmed by ` +
+          `${market.isDynamic ? "CA-based" : "symbol-based"} secondary source ` +
+          `(secondary=${secondaryPrice !== null ? `$${secondaryPrice.toFixed(4)}` : "unavailable"}). ` +
+          `Holding until cross-check passes or a Pyth price becomes available.`,
       );
       s.totalErrors++;
       s.consecutiveErrors++;
       return;
     }
-    log(`✓ [#33] ${market.label}: first push cross-check PASSED (${source} $${price.toFixed(4)} ≈ secondary $${secondaryPrice!.toFixed(4)})`);
+
+    log(`✅ [#33/#55] ${market.label}: first push cross-check PASSED (${source} $${price.toFixed(4)} ≈ secondary $${secondaryPrice!.toFixed(4)})`);
   }
 
   // Circuit breaker — use per-source bound for DexScreener (#34)
@@ -1657,9 +1683,9 @@ async function discoverNewMarkets(): Promise<MarketInfo[]> {
  * since they may not be in PYTH_FEED_IDS or JUPITER_MINTS.
  * This fetches price directly using the mainnet CA via Jupiter Lite API.
  */
-async function fetchPriceByCA(mainnetCA: string): Promise<PriceResult | null> {
-  // Validate as base58 Solana address before using in external URLs (#783, #784)
+async function fetchJupiterPriceByCA(mainnetCA: string): Promise<number | null> {
   if (!/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(mainnetCA)) return null;
+
   const encoded = encodeURIComponent(mainnetCA);
 
   try {
@@ -1671,11 +1697,18 @@ async function fetchPriceByCA(mainnetCA: string): Promise<PriceResult | null> {
     const data = json.data?.[mainnetCA];
     if (data?.price) {
       const p = parseFloat(data.price);
-      if (isFinite(p) && p > 0) return { price: p, source: "jupiter-ca", freshAt: Date.now() };
+      if (Number.isFinite(p) && p > 0) return p;
     }
   } catch {}
 
-  // DexScreener fallback — tag with tighter bound (#34)
+  return null;
+}
+
+async function fetchDexScreenerPriceByCA(mainnetCA: string): Promise<PriceResult | null> {
+  if (!/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(mainnetCA)) return null;
+
+  const encoded = encodeURIComponent(mainnetCA);
+
   try {
     const resp = await fetch(
       `https://api.dexscreener.com/latest/dex/tokens/${encoded}`,
@@ -1683,11 +1716,47 @@ async function fetchPriceByCA(mainnetCA: string): Promise<PriceResult | null> {
     );
     const json = (await resp.json()) as any;
     const pair = json.pairs?.[0];
+
     if (pair?.priceUsd) {
       const p = parseFloat(pair.priceUsd);
-      if (isFinite(p) && p > 0) return { price: p, source: "dexscreener-ca", freshAt: Date.now(), maxMovePct: DEXSCREENER_MAX_MOVE_PCT };
+      if (Number.isFinite(p) && p > 0) {
+        return {
+          price: p,
+          source: "dexscreener-ca",
+          freshAt: Date.now(),
+          maxMovePct: DEXSCREENER_MAX_MOVE_PCT,
+        };
+      }
     }
   } catch {}
+
+  return null;
+}
+
+async function fetchPriceByCA(mainnetCA: string): Promise<PriceResult | null> {
+  const jupiterPrice = await fetchJupiterPriceByCA(mainnetCA);
+
+  if (jupiterPrice !== null) {
+    return { price: jupiterPrice, source: "jupiter-ca", freshAt: Date.now() };
+  }
+
+  return fetchDexScreenerPriceByCA(mainnetCA);
+}
+
+async function fetchDynamicFirstPushSecondaryPrice(
+  mainnetCA: string,
+  primarySource: string,
+): Promise<number | null> {
+  const secondarySource = getDynamicFirstPushSecondarySource(primarySource);
+
+  if (secondarySource === "dexscreener-ca") {
+    const dex = await fetchDexScreenerPriceByCA(mainnetCA);
+    return dex?.price ?? null;
+  }
+
+  if (secondarySource === "jupiter-ca") {
+    return fetchJupiterPriceByCA(mainnetCA);
+  }
 
   return null;
 }
